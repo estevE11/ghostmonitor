@@ -1,4 +1,4 @@
-# mac-to-android-stream
+# Ghost Monitor
 
 Capture a macOS display (real or virtual) and stream it to an Android tablet's
 browser over your local network — no Android app to install. The tablet becomes
@@ -12,7 +12,7 @@ up to 60 fps, frames emitted only on content change, and the real hardware
 cursor composited natively. (The earlier `mss` backend capped at ~17 fps.)
 
 ```
-mac-to-android-stream/
+ghostmonitor/
 ├── app/
 │   ├── __init__.py
 │   ├── cli.py            # CLI parsing + Uvicorn launch + LAN IP discovery
@@ -29,7 +29,7 @@ mac-to-android-stream/
 Python 3.10+ recommended.
 
 ```bash
-cd mac-to-android-stream
+cd ghostmonitor
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -67,7 +67,7 @@ python -m app.cli start --display 1 --port 8080 --fps 60 --quality 80
 ```
 
 ```
-  mac-to-android-stream
+  Ghost Monitor
   display : 1
   fps     : 60
   quality : 80

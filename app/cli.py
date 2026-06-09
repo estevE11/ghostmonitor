@@ -83,7 +83,7 @@ def start(
     ip = _local_ip()
     url = f"http://{ip}:{port}"
 
-    typer.secho("\n  mac-to-android-stream", fg=typer.colors.CYAN, bold=True)
+    typer.secho("\n  Ghost Monitor", fg=typer.colors.CYAN, bold=True)
     typer.echo(f"  display : {display}")
     typer.echo(f"  fps     : {fps}")
     typer.echo(f"  quality : {quality}")

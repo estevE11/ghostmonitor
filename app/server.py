@@ -20,7 +20,7 @@ BOUNDARY = "frame"
 
 
 def create_app(capturer: ScreenCapturer) -> FastAPI:
-    app = FastAPI(title="mac-to-android-stream")
+    app = FastAPI(title="Ghost Monitor")
 
     @app.on_event("startup")
     async def _startup() -> None:
