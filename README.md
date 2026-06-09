@@ -35,6 +35,46 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+## Create a virtual display
+
+To use the tablet as a *secondary* monitor (not a mirror of your built-in
+screen), macOS needs a second display to exist. With no extra hardware you
+create a **virtual display** in software; Ghost Monitor then captures it like
+any real monitor.
+
+Pick one:
+
+| Tool | Cost | Install | Notes |
+|------|------|---------|-------|
+| **BetterDisplay** | Free (Pro optional) | `brew install --cask betterdisplay` · [github.com/waydabber/BetterDisplay](https://github.com/waydabber/BetterDisplay/releases) | Recommended. CLI to create displays headlessly. |
+| **BetterDisplay CLI** | Free | `brew install waydabber/betterdisplay/betterdisplaycli` | Companion `betterdisplaycli` used below. |
+| **Deskpad** | Free / open source | `brew install --cask deskpad` · [github.com/Stengo/DeskPad](https://github.com/Stengo/DeskPad/releases) | Simple fixed-size virtual screen. |
+| **Dummy HDMI plug** | ~$8 hardware | — | A "headless ghost" adapter; shows up as a real external display. |
+
+### Create one with BetterDisplay (CLI)
+
+```bash
+brew install --cask betterdisplay
+open -a BetterDisplay                       # launch once so the CLI can talk to it
+
+# create a 16:10 virtual screen with tablet-friendly resolutions
+betterdisplaycli create --type=VirtualScreen \
+  --name=Tablet --aspectWidth=16 --aspectHeight=10 \
+  --useResolutionList=on \
+  --resolutionList="1920x1200,1680x1050,1440x900,2560x1600" \
+  --virtualScreenHiDPI=on
+
+# connect it so macOS (and Ghost Monitor) see it as a real monitor
+betterdisplaycli set --name="Virtual 16:10" --connected=on
+```
+
+It now appears in `list-displays` as its own index. Remove it later with
+`betterdisplaycli discard --name="Virtual 16:10"`.
+
+Arrange where it sits relative to your main screen in **System Settings →
+Displays** (drag the blue rectangles), then drag windows onto it to push them
+to the tablet.
+
 ## macOS Screen Recording permission
 
 The first capture triggers a system prompt:
