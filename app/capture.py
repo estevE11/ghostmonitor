@@ -201,7 +201,9 @@ class ScreenCapturer:
         config.setMinimumFrameInterval_(CMTimeMake(1, self.fps))
         config.setShowsCursor_(True)  # composite the real hardware cursor
         config.setPixelFormat_(Quartz.kCVPixelFormatType_32BGRA)
-        config.setQueueDepth_(8)
+        # Keep this small: a deep queue adds capture-side latency (each buffered
+        # frame is ~1 frame of delay). We only ever serve the newest frame.
+        config.setQueueDepth_(3)
 
         sc_display = self._sc_display(display.index)
         content_filter = SCContentFilter.alloc().initWithDisplay_excludingWindows_(

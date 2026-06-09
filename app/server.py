@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse, Response
 
 from .capture import ScreenCapturer
@@ -46,6 +46,35 @@ def create_app(capturer: ScreenCapturer) -> FastAPI:
         if frame is None:
             return Response(status_code=503, content=b"no frame yet")
         return Response(content=frame, media_type="image/jpeg")
+
+    @app.websocket("/ws")
+    async def ws(websocket: WebSocket) -> None:
+        """Low-latency frame push, paced by the client.
+
+        Send the newest frame, then wait for the client's ack before sending
+        the next. This caps in-flight data at one frame, so stale frames are
+        dropped instead of queuing up in browser/TCP buffers (the cause of the
+        multi-hundred-ms lag with plain MJPEG). End-to-end latency collapses to
+        roughly one network round-trip plus a decode.
+        """
+        await websocket.accept()
+        last_seq = -1
+        try:
+            while True:
+                seq, frame = await asyncio.to_thread(
+                    capturer.wait_for_frame, last_seq, 1.0
+                )
+                if frame is None or seq == last_seq:
+                    # No new frame (static screen / timeout): empty keepalive,
+                    # so we don't re-send an identical JPEG every second.
+                    await websocket.send_bytes(b"")
+                else:
+                    last_seq = seq
+                    await websocket.send_bytes(frame)
+                # Block until the client finished rendering and asks for more.
+                await websocket.receive_text()
+        except (WebSocketDisconnect, RuntimeError):
+            return
 
     @app.get("/stream")
     async def stream(request: Request) -> StreamingResponse:

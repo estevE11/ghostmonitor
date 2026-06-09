@@ -21,10 +21,9 @@
       display: flex; align-items: center; justify-content: center;
     }
     #screen {
-      max-width: 100%; max-height: 100%;
       width: 100%; height: 100%;
-      object-fit: contain;            /* keep aspect ratio, no crop */
       display: block;
+      touch-action: none;
     }
     #status {
       position: fixed; top: 50%; left: 50%;
@@ -49,7 +48,7 @@
 </head>
 <body>
   <div id="stage">
-    <img id="screen" alt="" />
+    <canvas id="screen"></canvas>
     <div id="status">Connecting to Mac…</div>
   </div>
 
@@ -58,28 +57,71 @@
   </div>
 
   <script>
-    const img    = document.getElementById('screen');
+    const canvas = document.getElementById('screen');
+    const ctx    = canvas.getContext('2d', { alpha: false, desynchronized: true });
     const status = document.getElementById('status');
     const ui     = document.getElementById('ui');
     const fsBtn  = document.getElementById('fsBtn');
 
-    // Cache-bust so a reconnect doesn't reuse a dead stream.
-    function streamUrl() { return '/stream?t=' + Date.now(); }
+    // Size the canvas to the device pixels of the viewport.
+    function resizeCanvas() {
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width  = Math.round(window.innerWidth  * dpr);
+      canvas.height = Math.round(window.innerHeight * dpr);
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // Draw a frame letterboxed (object-fit: contain) into the canvas.
+    function drawFit(bmp) {
+      const cw = canvas.width, ch = canvas.height;
+      const scale = Math.min(cw / bmp.width, ch / bmp.height);
+      const w = bmp.width * scale, h = bmp.height * scale;
+      const x = (cw - w) / 2, y = (ch - h) / 2;
+      if (x > 0 || y > 0) { ctx.fillStyle = '#000'; ctx.fillRect(0, 0, cw, ch); }
+      ctx.drawImage(bmp, x, y, w, h);
+    }
+
+    // -- WebSocket: client-paced newest-frame delivery -------------------
+    let ws = null;
+    let rendering = false;
 
     function connect() {
       status.style.opacity = '1';
       status.textContent = 'Connecting to Mac…';
-      img.src = streamUrl();
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/ws`);
+      ws.binaryType = 'arraybuffer';
+
+      ws.onmessage = async (ev) => {
+        // Empty keepalive (static screen): ack immediately, nothing to draw.
+        if (!ev.data || ev.data.byteLength === 0) { ack(); return; }
+        // Drop frames if we somehow fall behind a render.
+        if (rendering) { ack(); return; }
+        rendering = true;
+        try {
+          const bmp = await createImageBitmap(new Blob([ev.data], { type: 'image/jpeg' }));
+          drawFit(bmp);
+          bmp.close();
+          status.style.opacity = '0';
+        } catch (_) { /* skip bad frame */ }
+        rendering = false;
+        ack();                      // request the next (newest) frame
+      };
+
+      ws.onclose = () => {
+        status.style.opacity = '1';
+        status.textContent = 'Reconnecting…';
+        setTimeout(connect, 1200);
+      };
+      ws.onerror = () => { try { ws.close(); } catch (_) {} };
     }
 
-    img.addEventListener('load', () => { status.style.opacity = '0'; });
-
-    // MJPEG <img> fires 'error' on disconnect / network drop -> retry.
-    img.addEventListener('error', () => {
-      status.style.opacity = '1';
-      status.textContent = 'Reconnecting…';
-      setTimeout(connect, 1500);
-    });
+    function ack() {
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send('n');
+    }
 
     // -- Fullscreen -------------------------------------------------------
     function isFullscreen() {
