@@ -7,12 +7,16 @@ a wireless secondary monitor / viewer.
 Uses a low-latency **MJPEG** stream (`multipart/x-mixed-replace`), so the client
 is just an `<img>` tag. Works in any modern mobile browser.
 
+Capture uses Apple's **ScreenCaptureKit** (macOS 12.3+): hardware-accelerated,
+up to 60 fps, frames emitted only on content change, and the real hardware
+cursor composited natively. (The earlier `mss` backend capped at ~17 fps.)
+
 ```
 mac-to-android-stream/
 ├── app/
 │   ├── __init__.py
 │   ├── cli.py            # CLI parsing + Uvicorn launch + LAN IP discovery
-│   ├── capture.py        # threaded mss capture + OpenCV JPEG encode
+│   ├── capture.py        # ScreenCaptureKit capture + OpenCV JPEG encode
 │   ├── server.py         # FastAPI MJPEG stream + serves index.html
 │   └── templates/
 │       └── index.html    # full-screen web receiver
@@ -48,25 +52,24 @@ python -m app.cli list-displays
 
 ```
 Available displays:
-  [0] 3840x1080 at (0, 0)  (all displays)
-  [1] 1920x1080 at (0, 0)  (monitor)
-  [2] 1920x1080 at (1920, 0)  (monitor)
+  [0] Built-in Display 2560x1600 at (0, 0)
+  [1] Virtual 16:10 1920x1200 at (-1920, 0)
 ```
 
-> Index `0` is every monitor stitched together. `1` is your primary display.
-> A **virtual display** (BetterDisplay, a dummy HDMI plug, etc.) shows up as
-> its own index — pick that index to stream only the virtual monitor.
+> Index `0` is the first display (usually built-in). A **virtual display**
+> (BetterDisplay, a dummy HDMI plug, etc.) shows up as its own index with its
+> name — pick that index to stream only the virtual monitor.
 
-Start streaming:
+Start streaming the virtual display at 60 fps:
 
 ```bash
-python -m app.cli start --display 1 --port 8080 --fps 30 --quality 80
+python -m app.cli start --display 1 --port 8080 --fps 60 --quality 80
 ```
 
 ```
   mac-to-android-stream
   display : 1
-  fps     : 30
+  fps     : 60
   quality : 80
 
   Open this URL on your Android tablet:

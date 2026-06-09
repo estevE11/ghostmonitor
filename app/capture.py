@@ -1,9 +1,17 @@
-"""macOS screen capture engine.
+"""macOS screen capture engine (ScreenCaptureKit backend).
 
-Grabs frames from a chosen monitor with ``mss``, optionally resizes them, and
-JPEG-encodes them with OpenCV. A background thread runs the capture loop at a
-target FPS and keeps only the most recent encoded frame, so slow consumers
-never build up latency.
+Captures a chosen display with Apple's ScreenCaptureKit (``SCStream``), which
+delivers hardware-accelerated frames at up to the display's refresh rate and
+only when content actually changes. Each frame's ``CVPixelBuffer`` is decoded
+to a numpy array and JPEG-encoded with OpenCV.
+
+This replaces the previous ``mss`` backend, whose CoreGraphics grab capped at
+~17 fps regardless of the requested rate. ScreenCaptureKit reaches 60 fps and
+composites the real hardware cursor for us (``showsCursor``), so no manual
+cursor drawing is needed.
+
+Public surface is unchanged: ``list_displays()``, ``Display``, and
+``ScreenCapturer`` with ``start``/``stop``/``get_frame``/``wait_for_frame``.
 """
 
 from __future__ import annotations
@@ -14,87 +22,145 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import cv2
-import mss
 import numpy as np
-
-# Optional: read the live mouse position so we can paint a cursor onto frames.
-# macOS draws the real cursor as a hardware overlay that screen grabs miss.
-try:
-    from Quartz import CGEventCreate, CGEventGetLocation
-
-    def _global_cursor():
-        loc = CGEventGetLocation(CGEventCreate(None))
-        return float(loc.x), float(loc.y)
-
-    _CURSOR_AVAILABLE = True
-except Exception:  # pragma: no cover - Quartz not installed / not macOS
-    def _global_cursor():
-        return None
-
-    _CURSOR_AVAILABLE = False
-
-
-# Classic arrow-pointer silhouette (tip at 0,0), in a ~12x19 unit box.
-_CURSOR_SHAPE = np.array(
-    [[0, 0], [0, 16], [4, 12], [7, 19], [9, 18], [6, 11], [11, 11]],
-    dtype=np.float32,
+import objc
+import libdispatch
+import Quartz
+from Foundation import NSObject
+from ScreenCaptureKit import (
+    SCShareableContent,
+    SCStreamConfiguration,
+    SCContentFilter,
+    SCStream,
+    SCStreamOutputTypeScreen,
 )
+from CoreMedia import CMTimeMake, CMSampleBufferGetImageBuffer
 
 
-def _draw_cursor(frame: np.ndarray, x: float, y: float, scale: float = 2.0) -> None:
-    """Paint a white arrow with a black outline at (x, y) on a BGR frame."""
-    pts = (_CURSOR_SHAPE * scale + np.array([x, y])).astype(np.int32)
-    cv2.fillPoly(frame, [pts], (255, 255, 255), lineType=cv2.LINE_AA)
-    cv2.polylines(frame, [pts], True, (0, 0, 0), 1, lineType=cv2.LINE_AA)
+# -- display discovery -----------------------------------------------------
 
 
 @dataclass
 class Display:
-    """A capturable monitor as reported by mss."""
+    """A capturable display as reported by ScreenCaptureKit."""
 
     index: int
-    left: int
-    top: int
+    display_id: int
     width: int
     height: int
+    left: int
+    top: int
+    name: str = ""
 
     def __str__(self) -> str:  # pragma: no cover - cosmetic
+        label = f" {self.name}" if self.name else ""
         return (
-            f"[{self.index}] {self.width}x{self.height} "
+            f"[{self.index}]{label} {self.width}x{self.height} "
             f"at ({self.left}, {self.top})"
         )
 
 
-def list_displays() -> List[Display]:
-    """Return the available displays.
+def _get_shareable_content(timeout: float = 5.0):
+    """Synchronously fetch SCShareableContent (the API is async/block-based).
 
-    mss exposes ``monitors[0]`` as the union of all monitors ("all displays")
-    and ``monitors[1:]`` as the individual physical/virtual monitors. We keep
-    the same indexing so ``--display 0`` means "everything" and ``--display 1``
-    is the primary monitor, matching mss's own convention.
+    Raises RuntimeError if Screen Recording permission is missing or the call
+    times out.
     """
+    result: dict = {}
+    done = threading.Event()
 
-    with mss.mss() as sct:
-        displays: List[Display] = []
-        for i, mon in enumerate(sct.monitors):
-            displays.append(
-                Display(
-                    index=i,
-                    left=mon["left"],
-                    top=mon["top"],
-                    width=mon["width"],
-                    height=mon["height"],
-                )
+    def handler(content, error):
+        result["content"] = content
+        result["error"] = error
+        done.set()
+
+    SCShareableContent.getShareableContentWithCompletionHandler_(handler)
+    if not done.wait(timeout):
+        raise RuntimeError("Timed out querying displays (ScreenCaptureKit).")
+    if result.get("error") is not None:
+        raise RuntimeError(
+            f"ScreenCaptureKit error: {result['error']}. "
+            "Grant Screen Recording permission in System Settings > "
+            "Privacy & Security > Screen Recording, then restart the terminal."
+        )
+    return result["content"]
+
+
+def _display_names() -> dict:
+    """Map CGDirectDisplayID -> friendly name via NSScreen."""
+    names: dict = {}
+    try:
+        from AppKit import NSScreen
+
+        for screen in NSScreen.screens():
+            did = int(screen.deviceDescription()["NSScreenNumber"])
+            names[did] = str(screen.localizedName())
+    except Exception:
+        pass
+    return names
+
+
+def list_displays() -> List[Display]:
+    """Return the capturable displays, indexed 0..N-1.
+
+    Index 0 is the first display (usually built-in); virtual displays created
+    by BetterDisplay/dummy plugs appear as their own index. Use the index with
+    ``start --display N``.
+    """
+    content = _get_shareable_content()
+    names = _display_names()
+    displays: List[Display] = []
+    for i, d in enumerate(content.displays()):
+        frame = d.frame()
+        did = int(d.displayID())
+        displays.append(
+            Display(
+                index=i,
+                display_id=did,
+                width=int(d.width()),
+                height=int(d.height()),
+                left=int(frame.origin.x),
+                top=int(frame.origin.y),
+                name=names.get(did, ""),
             )
-        return displays
+        )
+    return displays
+
+
+# -- stream output delegate ------------------------------------------------
+
+
+class _FrameOutput(NSObject):
+    """SCStreamOutput delegate: forwards each pixel buffer to a Python cb."""
+
+    def initWithCallback_(self, callback):
+        self = objc.super(_FrameOutput, self).init()
+        if self is None:
+            return None
+        self._callback = callback
+        return self
+
+    def stream_didOutputSampleBuffer_ofType_(self, stream, sbuf, sctype):
+        if sctype != SCStreamOutputTypeScreen:
+            return
+        pixel_buffer = CMSampleBufferGetImageBuffer(sbuf)
+        if pixel_buffer is None:
+            return
+        try:
+            self._callback(pixel_buffer)
+        except Exception as exc:  # never let an exception cross into ObjC
+            print(f"[capture] frame handler error: {exc!r}")
+
+
+# -- capturer --------------------------------------------------------------
 
 
 class ScreenCapturer:
-    """Threaded frame provider.
+    """Threaded frame provider backed by ScreenCaptureKit.
 
-    Continuously grabs the selected monitor, encodes to JPEG, and stores the
-    latest frame behind a lock. Consumers call :meth:`get_frame` to fetch the
-    most recent JPEG bytes.
+    Frames arrive on a background dispatch queue; each is JPEG-encoded and kept
+    as the single latest frame behind a condition variable, so slow consumers
+    skip ahead instead of accumulating latency.
     """
 
     def __init__(
@@ -103,140 +169,143 @@ class ScreenCapturer:
         fps: int = 30,
         quality: int = 80,
         max_width: Optional[int] = None,
-        draw_cursor: bool = True,
     ) -> None:
         self.display = display
         self.fps = max(1, fps)
         self.quality = max(1, min(100, quality))
         self.max_width = max_width
-        self.draw_cursor = draw_cursor and _CURSOR_AVAILABLE
 
         self._frame: Optional[bytes] = None
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
+        self._seq = 0
         self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._seq = 0  # increments on every new frame
+
+        # Strong refs so ObjC objects aren't garbage-collected mid-stream.
+        self._stream = None
+        self._output = None
+        self._queue = None
+        self._encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
 
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> None:
         if self._running:
             return
-        # Validate display up front so we fail fast (and trigger the macOS
-        # Screen Recording permission prompt) before the server starts.
-        self._validate_display()
-        self._running = True
-        self._thread = threading.Thread(
-            target=self._capture_loop, name="screen-capture", daemon=True
+        display = self._resolve_display()
+
+        config = SCStreamConfiguration.alloc().init()
+        config.setWidth_(display.width)
+        config.setHeight_(display.height)
+        # Caps the *max* rate; SCK still only emits frames on content change.
+        config.setMinimumFrameInterval_(CMTimeMake(1, self.fps))
+        config.setShowsCursor_(True)  # composite the real hardware cursor
+        config.setPixelFormat_(Quartz.kCVPixelFormatType_32BGRA)
+        config.setQueueDepth_(8)
+
+        sc_display = self._sc_display(display.index)
+        content_filter = SCContentFilter.alloc().initWithDisplay_excludingWindows_(
+            sc_display, []
         )
-        self._thread.start()
+
+        self._output = _FrameOutput.alloc().initWithCallback_(self._on_pixel_buffer)
+        self._queue = libdispatch.dispatch_queue_create(b"ghostmonitor.frames", None)
+        self._stream = SCStream.alloc().initWithFilter_configuration_delegate_(
+            content_filter, config, None
+        )
+        ok, err = self._stream.addStreamOutput_type_sampleHandlerQueue_error_(
+            self._output, SCStreamOutputTypeScreen, self._queue, None
+        )
+        if not ok:
+            raise RuntimeError(f"Failed to attach stream output: {err}")
+
+        started = threading.Event()
+        start_err: dict = {}
+
+        def handler(error):
+            start_err["error"] = error
+            started.set()
+
+        self._stream.startCaptureWithCompletionHandler_(handler)
+        if not started.wait(5.0):
+            raise RuntimeError("Timed out starting capture.")
+        if start_err.get("error") is not None:
+            raise RuntimeError(f"startCapture failed: {start_err['error']}")
+        self._running = True
 
     def stop(self) -> None:
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
+        if self._stream is not None:
+            try:
+                self._stream.stopCaptureWithCompletionHandler_(lambda e: None)
+            except Exception:
+                pass
+        self._stream = None
+        self._output = None
+        self._queue = None
 
     # -- public API --------------------------------------------------------
 
     def get_frame(self) -> Optional[bytes]:
-        """Return the latest encoded JPEG frame, or ``None`` if not ready."""
         with self._lock:
             return self._frame
 
     def wait_for_frame(self, last_seq: int, timeout: float = 1.0):
-        """Block until a frame newer than ``last_seq`` is available.
-
-        Returns ``(seq, frame_bytes)``. On timeout returns the current frame
-        even if unchanged so callers can re-check liveness.
-        """
         with self._cond:
             self._cond.wait_for(lambda: self._seq != last_seq, timeout=timeout)
             return self._seq, self._frame
 
     # -- internals ---------------------------------------------------------
 
-    def _validate_display(self) -> None:
-        with mss.mss() as sct:
-            count = len(sct.monitors)
-        if self.display < 0 or self.display >= count:
+    def _resolve_display(self) -> Display:
+        displays = list_displays()
+        if self.display < 0 or self.display >= len(displays):
             raise ValueError(
                 f"Display index {self.display} out of range. "
-                f"Valid indexes: 0..{count - 1}. "
+                f"Valid indexes: 0..{len(displays) - 1}. "
                 f"Run 'list-displays' to see options."
             )
+        return displays[self.display]
 
-    def _encode(self, frame: np.ndarray) -> Optional[bytes]:
-        params = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
-        ok, buf = cv2.imencode(".jpg", frame, params)
-        if not ok:
-            return None
-        return buf.tobytes()
+    def _validate_display(self) -> None:
+        # Also triggers the Screen Recording permission prompt early.
+        self._resolve_display()
 
-    def _capture_loop(self) -> None:
-        frame_interval = 1.0 / self.fps
-        # mss instances are not thread-safe across threads; create our own.
-        with mss.mss() as sct:
-            try:
-                monitor = sct.monitors[self.display]
-            except IndexError:
-                self._running = False
+    def _sc_display(self, index: int):
+        content = _get_shareable_content()
+        return content.displays()[index]
+
+    def _on_pixel_buffer(self, pixel_buffer) -> None:
+        Quartz.CVPixelBufferLockBaseAddress(pixel_buffer, 1)  # read-only
+        try:
+            width = Quartz.CVPixelBufferGetWidth(pixel_buffer)
+            height = Quartz.CVPixelBufferGetHeight(pixel_buffer)
+            bytes_per_row = Quartz.CVPixelBufferGetBytesPerRow(pixel_buffer)
+            base = Quartz.CVPixelBufferGetBaseAddress(pixel_buffer)
+            if base is None:
                 return
+            buf = base.as_buffer(bytes_per_row * height)
+            # BGRA with possible row padding -> crop to width, drop alpha.
+            frame = np.frombuffer(buf, dtype=np.uint8).reshape(
+                (height, bytes_per_row // 4, 4)
+            )[:, :width, :3]
 
-            while self._running:
-                start = time.perf_counter()
-                try:
-                    raw = sct.grab(monitor)
-                    # BGRA -> contiguous BGR. cvtColor yields a fresh, writable,
-                    # C-contiguous array (required by cv2 draw calls below);
-                    # a plain ``[:, :, :3]`` slice is a non-contiguous view and
-                    # makes fillPoly raise.
-                    frame = cv2.cvtColor(np.asarray(raw), cv2.COLOR_BGRA2BGR)
+            if self.max_width and width > self.max_width:
+                scale = self.max_width / width
+                frame = cv2.resize(
+                    frame,
+                    (self.max_width, max(1, int(height * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
 
-                    # Paint the cursor at full resolution, before any resize,
-                    # so it scales naturally with the rest of the frame.
-                    if self.draw_cursor:
-                        pos = _global_cursor()
-                        if pos is not None:
-                            mw = monitor["width"] or frame.shape[1]
-                            mh = monitor["height"] or frame.shape[0]
-                            sx = frame.shape[1] / mw
-                            sy = frame.shape[0] / mh
-                            cx = (pos[0] - monitor["left"]) * sx
-                            cy = (pos[1] - monitor["top"]) * sy
-                            if 0 <= cx < frame.shape[1] and 0 <= cy < frame.shape[0]:
-                                _draw_cursor(frame, cx, cy)
+            ok, encoded = cv2.imencode(".jpg", frame, self._encode_params)
+            if not ok:
+                return
+            data = encoded.tobytes()
+        finally:
+            Quartz.CVPixelBufferUnlockBaseAddress(pixel_buffer, 1)
 
-                    if self.max_width and frame.shape[1] > self.max_width:
-                        scale = self.max_width / frame.shape[1]
-                        new_size = (
-                            self.max_width,
-                            max(1, int(frame.shape[0] * scale)),
-                        )
-                        frame = cv2.resize(
-                            frame, new_size, interpolation=cv2.INTER_AREA
-                        )
-
-                    encoded = self._encode(frame)
-                    if encoded is not None:
-                        with self._cond:
-                            self._frame = encoded
-                            self._seq += 1
-                            self._cond.notify_all()
-                except Exception as exc:  # capture must never die silently
-                    # Most commonly: display unplugged or resolution change.
-                    # Re-resolve the monitor list and keep going.
-                    print(f"[capture] frame error: {exc!r}; retrying")
-                    time.sleep(0.5)
-                    try:
-                        sct = mss.mss()
-                        monitor = sct.monitors[self.display]
-                    except Exception:
-                        pass
-
-                # Pace to target FPS.
-                elapsed = time.perf_counter() - start
-                sleep_for = frame_interval - elapsed
-                if sleep_for > 0:
-                    time.sleep(sleep_for)
+        with self._cond:
+            self._frame = data
+            self._seq += 1
+            self._cond.notify_all()

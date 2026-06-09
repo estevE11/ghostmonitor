@@ -1,7 +1,11 @@
 fastapi>=0.110
 uvicorn[standard]>=0.29
-mss>=9.0
 opencv-python>=4.9
 numpy>=1.24
 typer>=0.12
-pyobjc-framework-Quartz>=10.0  ; sys_platform == "darwin"
+# macOS ScreenCaptureKit capture backend (60fps, native cursor)
+pyobjc-framework-ScreenCaptureKit>=10.0 ; sys_platform == "darwin"
+pyobjc-framework-CoreMedia>=10.0 ; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0 ; sys_platform == "darwin"
+pyobjc-framework-libdispatch>=10.0 ; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=10.0 ; sys_platform == "darwin"

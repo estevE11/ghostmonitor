@@ -42,11 +42,11 @@ def list_displays_cmd() -> None:
     displays = _list_displays()
     typer.echo("Available displays:")
     for d in displays:
-        label = "all displays" if d.index == 0 else "monitor"
-        typer.echo(f"  {d}  ({label})")
+        typer.echo(f"  {d}")
     typer.echo(
         "\nUse the index with 'start --display N'. "
-        "Index 0 captures every monitor stitched together."
+        "Virtual displays (BetterDisplay / dummy plugs) appear as their own "
+        "index — pick that to stream only the virtual monitor."
     )
 
 
